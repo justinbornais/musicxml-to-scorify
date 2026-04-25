@@ -2,7 +2,7 @@
 
 Convert MusicXML files into Typst [Scorify](https://github.com/justinbornais/typst-sheet-music) `#score(...)` calls.
 
-The converter is written in Rust. File handling lives in the CLI, while the conversion core accepts a `&str` and returns Typst text, which keeps the main path suitable for a future WASM wrapper.
+The converter is written in Rust. The conversion core is shared by the CLI and the WASM build, so browser callers can convert pasted MusicXML text or uploaded `.musicxml`/`.xml`/`.mxl` files into Typst code.
 
 ## Usage
 
@@ -40,13 +40,83 @@ The Scorify output intentionally stays textual and editable. Unsupported MusicXM
 ## Library Entry Points
 
 ```rust
-use musicxml_to_scorify::{convert_musicxml_to_scorify, ConversionOptions};
+use musicxml_to_scorify::{
+    convert_musicxml_file_to_scorify,
+    convert_musicxml_to_scorify,
+    ConversionOptions,
+};
 
 let typst = convert_musicxml_to_scorify(xml, &ConversionOptions::default())?;
+let typst_from_file = convert_musicxml_file_to_scorify(
+    bytes,
+    "score.mxl",
+    &ConversionOptions::default(),
+)?;
 ```
 
-For `wasm32` builds, the crate also exposes:
+## WASM Build
 
-```rust
-convert_musicxml_to_scorify_wasm(xml: &str) -> Result<String, JsValue>
+Install the target and `wasm-bindgen` CLI once:
+
+```powershell
+rustup target add wasm32-unknown-unknown
+cargo install wasm-bindgen-cli
 ```
+
+Build the browser package:
+
+```powershell
+.\scripts\build-wasm.ps1
+```
+
+On macOS/Linux:
+
+```sh
+sh scripts/build-wasm.sh
+```
+
+This writes a browser-loadable package to `pkg/`, including `musicxml_to_scorify.js` and `musicxml_to_scorify_bg.wasm`.
+
+The generated module exposes:
+
+```js
+convert_musicxml_text_wasm(xml)
+convert_musicxml_text_with_options_wasm(xml, optionsJson)
+convert_musicxml_file_wasm(bytes, filename, optionsJson)
+```
+
+`optionsJson` uses camelCase keys:
+
+```json
+{
+  "includeImport": true,
+  "package": "@preview/scorify:0.3.0",
+  "measuresPerLine": 4,
+  "includeComment": false
+}
+```
+
+Browser example:
+
+```js
+import init, {
+  convert_musicxml_file_wasm,
+  convert_musicxml_text_with_options_wasm,
+} from "./pkg/musicxml_to_scorify.js";
+
+await init();
+
+const typstFromText = convert_musicxml_text_with_options_wasm(
+  musicXmlString,
+  JSON.stringify({ includeImport: false }),
+);
+
+const bytes = new Uint8Array(await file.arrayBuffer());
+const typstFromFile = convert_musicxml_file_wasm(
+  bytes,
+  file.name,
+  JSON.stringify({ includeImport: true }),
+);
+```
+
+See `examples/browser.html` for a tiny file-upload example.

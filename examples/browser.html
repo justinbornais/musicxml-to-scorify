@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>MusicXML to Scorify WASM Example</title>
+  </head>
+  <body>
+    <input id="file" type="file" accept=".musicxml,.xml,.mxl" />
+    <textarea id="output" rows="24" cols="100"></textarea>
+
+    <script type="module">
+      import init, {
+        convert_musicxml_file_wasm,
+      } from "../pkg/musicxml_to_scorify.js";
+
+      await init();
+
+      const fileInput = document.getElementById("file");
+      const output = document.getElementById("output");
+
+      fileInput.addEventListener("change", async () => {
+        const file = fileInput.files?.[0];
+        if (!file) return;
+
+        const bytes = new Uint8Array(await file.arrayBuffer());
+        const options = JSON.stringify({
+          includeImport: true,
+          includeComment: false,
+        });
+
+        output.value = convert_musicxml_file_wasm(bytes, file.name, options);
+      });
+    </script>
+  </body>
+</html>
