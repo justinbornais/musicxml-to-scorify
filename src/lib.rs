@@ -1232,7 +1232,7 @@ fn parse_lyric(lyric: Node<'_, '_>) -> Option<String> {
     for child in lyric.children().filter(|node| node.is_element()) {
         match child.tag_name().name() {
             "syllabic" => {}
-            "text" => text.push_str(child.text().unwrap_or("")),
+            "text" => text.push_str(&normalize_lyric_text(child.text().unwrap_or(""))),
             "extend" => text.push('_'),
             _ => {}
         }
@@ -1247,6 +1247,26 @@ fn parse_lyric(lyric: Node<'_, '_>) -> Option<String> {
         }
         Some(text)
     }
+}
+
+fn normalize_lyric_text(value: &str) -> String {
+    let mut out = String::new();
+    let mut chars = value.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch == '\u{00c2}' && chars.peek() == Some(&'\u{00a0}') {
+            chars.next();
+            out.push(' ');
+        } else if matches!(ch, '\u{00a0}' | '\u{202f}' | '\u{2007}' | '\u{feff}') {
+            out.push(' ');
+        } else if ch.is_whitespace() {
+            out.push(' ');
+        } else {
+            out.push(ch);
+        }
+    }
+
+    out
 }
 
 fn parse_lyrics(note: Node<'_, '_>) -> Vec<LyricToken> {
@@ -1640,6 +1660,46 @@ mod tests {
             "{result}"
         );
         assert!(!result.contains("major-sixth"), "{result}");
+    }
+
+    #[test]
+    fn normalizes_non_breaking_spaces_in_lyrics() {
+        let xml = r#"
+<score-partwise version="4.0">
+  <part-list><score-part id="P1"><part-name>Voice</part-name></score-part></part-list>
+  <part id="P1"><measure number="1">
+    <attributes><divisions>1</divisions><time><beats>4</beats><beat-type>4</beat-type></time></attributes>
+    <note>
+      <pitch><step>C</step><octave>4</octave></pitch>
+      <duration>1</duration>
+      <type>quarter</type>
+      <lyric><syllabic>begin</syllabic><text>1.&#160;Ev</text></lyric>
+    </note>
+    <note>
+      <pitch><step>D</step><octave>4</octave></pitch>
+      <duration>1</duration>
+      <type>quarter</type>
+      <lyric><syllabic>single</syllabic><text>2.&#194;&#160;Ev</text></lyric>
+    </note>
+  </measure></part>
+</score-partwise>
+"#;
+
+        let result = convert_musicxml_to_scorify(
+            xml,
+            &ConversionOptions {
+                include_import: false,
+                ..ConversionOptions::default()
+            },
+        )
+        .unwrap();
+
+        assert!(
+            result.contains("music: \"c4l[1. Ev-] d4l[2. Ev]\""),
+            "{result}"
+        );
+        assert!(!result.contains('\u{00a0}'), "{result}");
+        assert!(!result.contains('\u{00c2}'), "{result}");
     }
 
     #[test]
