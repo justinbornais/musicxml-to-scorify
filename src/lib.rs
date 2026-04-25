@@ -233,7 +233,7 @@ struct NoteToken {
     dynamic: Option<String>,
     chord_symbol: Option<String>,
     staff_text: Option<String>,
-    lyric: Option<String>,
+    lyrics: Vec<String>,
     articulations: Vec<&'static str>,
 }
 
@@ -730,10 +730,7 @@ fn parse_note_token(
         .children()
         .filter(|node| node.has_tag_name("dot"))
         .count();
-    let lyric = note
-        .children()
-        .find(|node| node.has_tag_name("lyric"))
-        .and_then(parse_lyric);
+    let lyrics = parse_lyrics(note);
 
     Some(Token::Note(NoteToken {
         clef,
@@ -751,7 +748,7 @@ fn parse_note_token(
         dynamic: pending.dynamic,
         chord_symbol: pending.chord_symbol,
         staff_text: pending.staff_text,
-        lyric,
+        lyrics,
         articulations,
     }))
 }
@@ -916,7 +913,7 @@ fn note_to_string(note: &NoteToken, duration: i32, divisions: i32) -> String {
         token.push_str(&escape_inline(chord));
         token.push(']');
     }
-    if let Some(lyric) = &note.lyric {
+    for lyric in &note.lyrics {
         token.push_str("l[");
         token.push_str(&escape_inline(lyric));
         token.push(']');
@@ -1216,6 +1213,28 @@ fn parse_lyric(lyric: Node<'_, '_>) -> Option<String> {
     }
 }
 
+fn parse_lyrics(note: Node<'_, '_>) -> Vec<String> {
+    let mut lyrics = note
+        .children()
+        .filter(|node| node.has_tag_name("lyric"))
+        .enumerate()
+        .filter_map(|(index, lyric)| {
+            let text = parse_lyric(lyric)?;
+            let verse = lyric.attribute("number").and_then(|value| {
+                value
+                    .trim()
+                    .parse::<u32>()
+                    .ok()
+                    .filter(|number| *number > 0)
+            });
+            Some((verse.unwrap_or(u32::MAX), index, text))
+        })
+        .collect::<Vec<_>>();
+
+    lyrics.sort_by_key(|(verse, index, _)| (*verse, *index));
+    lyrics.into_iter().map(|(_, _, text)| text).collect()
+}
+
 fn staff_from_voice(voice: Option<&str>) -> Option<usize> {
     let voice = voice?.parse::<usize>().ok()?;
     if voice >= 5 { Some(2) } else { Some(1) }
@@ -1459,6 +1478,46 @@ mod tests {
 
         assert!(result.contains("time: \"4/4\""));
         assert!(result.contains("music: \"c4\""));
+    }
+
+    #[test]
+    fn emits_multiple_numbered_lyric_verses_on_one_note() {
+        let xml = r#"
+<score-partwise version="4.0">
+  <part-list><score-part id="P1"><part-name>Voice</part-name></score-part></part-list>
+  <part id="P1"><measure number="1">
+    <attributes><divisions>1</divisions><time><beats>4</beats><beat-type>4</beat-type></time></attributes>
+    <note>
+      <pitch><step>C</step><octave>4</octave></pitch>
+      <duration>1</duration>
+      <type>quarter</type>
+      <lyric number="2"><syllabic>single</syllabic><text>Second</text></lyric>
+      <lyric number="1"><syllabic>begin</syllabic><text>First</text></lyric>
+    </note>
+    <note>
+      <pitch><step>D</step><octave>4</octave></pitch>
+      <duration>1</duration>
+      <type>quarter</type>
+      <lyric number="1"><syllabic>end</syllabic><text>verse</text></lyric>
+      <lyric number="2"><syllabic>single</syllabic><text>line</text></lyric>
+    </note>
+  </measure></part>
+</score-partwise>
+"#;
+
+        let result = convert_musicxml_to_scorify(
+            xml,
+            &ConversionOptions {
+                include_import: false,
+                ..ConversionOptions::default()
+            },
+        )
+        .unwrap();
+
+        assert!(
+            result.contains("music: \"c4l[First-]l[Second] d4l[verse]l[line]\""),
+            "{result}"
+        );
     }
 
     #[test]
