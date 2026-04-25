@@ -1,6 +1,11 @@
-use std::collections::{BTreeMap, HashMap};
+use std::{
+    collections::{BTreeMap, HashMap},
+    io::{Cursor, Read},
+    string::FromUtf8Error,
+};
 
 use roxmltree::{Document, Node, ParsingOptions};
+use serde::Deserialize;
 use thiserror::Error;
 
 #[cfg(target_arch = "wasm32")]
@@ -12,6 +17,26 @@ pub struct ConversionOptions {
     pub package: String,
     pub measures_per_line: Option<u32>,
     pub include_comment: bool,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ConversionOptionsPatch {
+    include_import: Option<bool>,
+    package: Option<String>,
+    measures_per_line: Option<u32>,
+    include_comment: Option<bool>,
+}
+
+impl ConversionOptions {
+    fn apply_patch(&self, patch: ConversionOptionsPatch) -> Self {
+        Self {
+            include_import: patch.include_import.unwrap_or(self.include_import),
+            package: patch.package.unwrap_or_else(|| self.package.clone()),
+            measures_per_line: patch.measures_per_line.or(self.measures_per_line),
+            include_comment: patch.include_comment.unwrap_or(self.include_comment),
+        }
+    }
 }
 
 impl Default for ConversionOptions {
@@ -29,6 +54,16 @@ impl Default for ConversionOptions {
 pub enum ConvertError {
     #[error("invalid MusicXML: {0}")]
     Xml(#[from] roxmltree::Error),
+    #[error("MusicXML file is not valid UTF-8: {0}")]
+    Utf8(#[from] FromUtf8Error),
+    #[error("failed to read compressed .mxl archive: {0}")]
+    Zip(#[from] zip::result::ZipError),
+    #[error("failed to read compressed .mxl archive entry: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("no MusicXML score file found in .mxl archive")]
+    NoScoreInArchive,
+    #[error("invalid conversion options JSON: {0}")]
+    OptionsJson(#[from] serde_json::Error),
     #[error("MusicXML document does not contain a score-partwise root")]
     MissingScore,
     #[error("MusicXML score contains no parts")]
@@ -43,11 +78,68 @@ pub fn convert_musicxml_to_scorify(
     Ok(emit_typst(&score, options))
 }
 
+pub fn convert_musicxml_file_to_scorify(
+    bytes: &[u8],
+    filename: &str,
+    options: &ConversionOptions,
+) -> Result<String, ConvertError> {
+    let xml = read_musicxml_bytes(bytes, filename)?;
+    convert_musicxml_to_scorify(&xml, options)
+}
+
+pub fn read_musicxml_bytes(bytes: &[u8], filename: &str) -> Result<String, ConvertError> {
+    if is_mxl_file(bytes, filename) {
+        read_mxl(bytes)
+    } else {
+        String::from_utf8(bytes.to_vec()).map_err(ConvertError::Utf8)
+    }
+}
+
+pub fn conversion_options_from_json(options_json: &str) -> Result<ConversionOptions, ConvertError> {
+    if options_json.trim().is_empty() {
+        return Ok(ConversionOptions::default());
+    }
+
+    let patch: ConversionOptionsPatch = serde_json::from_str(options_json)?;
+    Ok(ConversionOptions::default().apply_patch(patch))
+}
+
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen]
 pub fn convert_musicxml_to_scorify_wasm(xml: &str) -> Result<String, JsValue> {
-    convert_musicxml_to_scorify(xml, &ConversionOptions::default())
-        .map_err(|err| JsValue::from_str(&err.to_string()))
+    convert_musicxml_text_wasm(xml)
+}
+
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn convert_musicxml_text_wasm(xml: &str) -> Result<String, JsValue> {
+    convert_musicxml_to_scorify(xml, &ConversionOptions::default()).map_err(js_error)
+}
+
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn convert_musicxml_text_with_options_wasm(
+    xml: &str,
+    options_json: &str,
+) -> Result<String, JsValue> {
+    let options = conversion_options_from_json(options_json).map_err(js_error)?;
+    convert_musicxml_to_scorify(xml, &options).map_err(js_error)
+}
+
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn convert_musicxml_file_wasm(
+    bytes: &[u8],
+    filename: &str,
+    options_json: &str,
+) -> Result<String, JsValue> {
+    let options = conversion_options_from_json(options_json).map_err(js_error)?;
+    convert_musicxml_file_to_scorify(bytes, filename, &options).map_err(js_error)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn js_error(error: ConvertError) -> JsValue {
+    JsValue::from_str(&error.to_string())
 }
 
 #[derive(Debug, Clone, Default)]
@@ -241,6 +333,55 @@ fn parse_musicxml_document(xml: &str) -> Result<Document<'_>, roxmltree::Error> 
             ..ParsingOptions::default()
         },
     )
+}
+
+fn is_mxl_file(bytes: &[u8], filename: &str) -> bool {
+    filename
+        .rsplit('.')
+        .next()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("mxl"))
+        || bytes.starts_with(b"PK\x03\x04")
+}
+
+fn read_mxl(bytes: &[u8]) -> Result<String, ConvertError> {
+    let cursor = Cursor::new(bytes);
+    let mut archive = zip::ZipArchive::new(cursor)?;
+
+    let container_xml = match archive.by_name("META-INF/container.xml") {
+        Ok(mut container) => {
+            let mut container_xml = String::new();
+            container.read_to_string(&mut container_xml)?;
+            Some(container_xml)
+        }
+        Err(_) => None,
+    };
+
+    if let Some(container_xml) = container_xml {
+        if let Ok(doc) = parse_musicxml_document(&container_xml) {
+            if let Some(full_path) = doc
+                .descendants()
+                .find(|node| node.has_tag_name("rootfile"))
+                .and_then(|node| node.attribute("full-path"))
+            {
+                let mut score = archive.by_name(full_path)?;
+                let mut xml = String::new();
+                score.read_to_string(&mut xml)?;
+                return Ok(xml);
+            }
+        }
+    }
+
+    for i in 0..archive.len() {
+        let mut file = archive.by_index(i)?;
+        let lower = file.name().to_ascii_lowercase();
+        if lower.ends_with(".musicxml") || lower.ends_with(".xml") {
+            let mut xml = String::new();
+            file.read_to_string(&mut xml)?;
+            return Ok(xml);
+        }
+    }
+
+    Err(ConvertError::NoScoreInArchive)
 }
 
 fn collect_part_infos(root: Node<'_, '_>) -> Vec<PartInfo> {
@@ -1318,5 +1459,60 @@ mod tests {
 
         assert!(result.contains("time: \"4/4\""));
         assert!(result.contains("music: \"c4\""));
+    }
+
+    #[test]
+    fn converts_file_bytes_and_json_options() {
+        let options = conversion_options_from_json(
+            r#"{"includeImport":false,"includeComment":true,"measuresPerLine":2}"#,
+        )
+        .unwrap();
+        let result =
+            convert_musicxml_file_to_scorify(SIMPLE_XML.as_bytes(), "simple.musicxml", &options)
+                .unwrap();
+
+        assert!(result.starts_with("// Generated by musicxml-to-scorify."));
+        assert!(!result.contains("#import"));
+        assert!(result.contains("measures-per-line: 2"));
+    }
+
+    #[test]
+    fn extracts_compressed_mxl_bytes() {
+        use std::io::Write;
+
+        let mut bytes = Vec::new();
+        {
+            let cursor = Cursor::new(&mut bytes);
+            let mut archive = zip::ZipWriter::new(cursor);
+            let options = zip::write::SimpleFileOptions::default();
+
+            archive
+                .start_file("META-INF/container.xml", options)
+                .unwrap();
+            archive
+                .write_all(
+                    br#"<?xml version="1.0" encoding="UTF-8"?>
+<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+  <rootfiles><rootfile full-path="score.musicxml"/></rootfiles>
+</container>"#,
+                )
+                .unwrap();
+            archive.start_file("score.musicxml", options).unwrap();
+            archive.write_all(SIMPLE_XML.as_bytes()).unwrap();
+            archive.finish().unwrap();
+        }
+
+        let result = convert_musicxml_file_to_scorify(
+            &bytes,
+            "simple.mxl",
+            &ConversionOptions {
+                include_import: false,
+                ..ConversionOptions::default()
+            },
+        )
+        .unwrap();
+
+        assert!(result.contains("title: \"Tiny Tune\""));
+        assert!(result.contains("music: \"<f# a>4v[mf]l[Joy] r4\""));
     }
 }
