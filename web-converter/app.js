@@ -67,9 +67,28 @@ const compilerWasm =
   "https://cdn.jsdelivr.net/npm/@myriaddreamin/typst-ts-web-compiler/pkg/typst_ts_web_compiler_bg.wasm";
 const rendererWasm =
   "https://cdn.jsdelivr.net/npm/@myriaddreamin/typst-ts-renderer/pkg/typst_ts_renderer_bg.wasm";
+const themeStorageKey = "musicxml-to-scorify-theme";
+const themeLabels = {
+  system: "System",
+  light: "Light",
+  dark: "Dark",
+};
 
 function classNames(...values) {
   return values.filter(Boolean).join(" ");
+}
+
+function systemTheme() {
+  return window.matchMedia?.("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+}
+
+function storedThemePreference() {
+  const saved = localStorage.getItem(themeStorageKey);
+  return saved === "light" || saved === "dark" ? saved : "system";
+}
+
+function resolvedTheme(preference) {
+  return preference === "system" ? systemTheme() : preference;
 }
 
 function typstDocument(scoreCall) {
@@ -163,6 +182,8 @@ function App() {
   const [error, setError] = useState("");
   const [isConverting, setIsConverting] = useState(false);
   const [isRendering, setIsRendering] = useState(false);
+  const [themePreference, setThemePreference] = useState(storedThemePreference);
+  const [activeTheme, setActiveTheme] = useState(() => resolvedTheme(storedThemePreference()));
   const previewRef = useRef(null);
 
   const canConvert = useMemo(() => {
@@ -192,6 +213,29 @@ function App() {
       alive = false;
     };
   }, []);
+
+  useEffect(() => {
+    const applyTheme = () => {
+      const next = resolvedTheme(themePreference);
+      setActiveTheme(next);
+      document.documentElement.dataset.theme = next;
+      document.documentElement.style.colorScheme = next;
+    };
+
+    applyTheme();
+
+    if (themePreference === "system") {
+      localStorage.removeItem(themeStorageKey);
+    } else {
+      localStorage.setItem(themeStorageKey, themePreference);
+    }
+
+    const media = window.matchMedia?.("(prefers-color-scheme: dark)");
+    if (themePreference !== "system" || !media) return undefined;
+
+    media.addEventListener("change", applyTheme);
+    return () => media.removeEventListener("change", applyTheme);
+  }, [themePreference]);
 
   useEffect(() => {
     if (!previewHtml || !previewRef.current) return;
@@ -281,6 +325,14 @@ function App() {
     }
   }
 
+  function cycleTheme() {
+    setThemePreference((current) => {
+      if (current === "system") return "light";
+      if (current === "light") return "dark";
+      return "system";
+    });
+  }
+
   return h("main", { class: "shell" }, [
     h("header", { class: "topbar" }, [
       h("div", { class: "brand" }, [
@@ -292,6 +344,19 @@ function App() {
       ]),
       h("div", { class: "topActions" }, [
         h("span", { class: classNames("pill", runtimeStatus === "Ready" && "good") }, runtimeStatus),
+        h(
+          "button",
+          {
+            class: "themeToggle",
+            onClick: cycleTheme,
+            title: `Theme: ${themeLabels[themePreference]} (${activeTheme})`,
+            type: "button",
+          },
+          [
+            h("span", { "aria-hidden": "true" }, activeTheme === "dark" ? "Moon" : "Sun"),
+            h("span", null, themeLabels[themePreference]),
+          ],
+        ),
         h(
           "button",
           {
