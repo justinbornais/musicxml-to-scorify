@@ -233,7 +233,7 @@ struct NoteToken {
     dynamic: Option<String>,
     chord_symbol: Option<String>,
     staff_text: Option<String>,
-    lyrics: Vec<String>,
+    lyrics: Vec<LyricToken>,
     articulations: Vec<&'static str>,
 }
 
@@ -243,6 +243,12 @@ struct PitchToken {
     alter: i32,
     accidental_text: Option<String>,
     octave: i32,
+}
+
+#[derive(Debug, Clone)]
+struct LyricToken {
+    verse: Option<u32>,
+    text: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -913,10 +919,8 @@ fn note_to_string(note: &NoteToken, duration: i32, divisions: i32) -> String {
         token.push_str(&escape_inline(chord));
         token.push(']');
     }
-    for lyric in &note.lyrics {
-        token.push_str("l[");
-        token.push_str(&escape_inline(lyric));
-        token.push(']');
+    for lyric in lyric_tokens_to_scorify(&note.lyrics) {
+        token.push_str(&lyric);
     }
 
     token
@@ -1213,7 +1217,7 @@ fn parse_lyric(lyric: Node<'_, '_>) -> Option<String> {
     }
 }
 
-fn parse_lyrics(note: Node<'_, '_>) -> Vec<String> {
+fn parse_lyrics(note: Node<'_, '_>) -> Vec<LyricToken> {
     let mut lyrics = note
         .children()
         .filter(|node| node.has_tag_name("lyric"))
@@ -1227,12 +1231,34 @@ fn parse_lyrics(note: Node<'_, '_>) -> Vec<String> {
                     .ok()
                     .filter(|number| *number > 0)
             });
-            Some((verse.unwrap_or(u32::MAX), index, text))
+            Some((verse.unwrap_or(u32::MAX), index, LyricToken { verse, text }))
         })
         .collect::<Vec<_>>();
 
     lyrics.sort_by_key(|(verse, index, _)| (*verse, *index));
-    lyrics.into_iter().map(|(_, _, text)| text).collect()
+    lyrics.into_iter().map(|(_, _, lyric)| lyric).collect()
+}
+
+fn lyric_tokens_to_scorify(lyrics: &[LyricToken]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut next_numbered_verse = 1;
+
+    for lyric in lyrics {
+        if let Some(verse) = lyric.verse {
+            while next_numbered_verse < verse {
+                out.push("l".to_string());
+                next_numbered_verse += 1;
+            }
+            next_numbered_verse = verse.saturating_add(1);
+        }
+
+        let mut text = String::from("l[");
+        text.push_str(&escape_inline(&lyric.text));
+        text.push(']');
+        out.push(text);
+    }
+
+    out
 }
 
 fn staff_from_voice(voice: Option<&str>) -> Option<usize> {
@@ -1518,6 +1544,35 @@ mod tests {
             result.contains("music: \"c4l[First-]l[Second] d4l[verse]l[line]\""),
             "{result}"
         );
+    }
+
+    #[test]
+    fn emits_empty_lyric_placeholders_for_later_verse_only() {
+        let xml = r#"
+<score-partwise version="4.0">
+  <part-list><score-part id="P1"><part-name>Voice</part-name></score-part></part-list>
+  <part id="P1"><measure number="1">
+    <attributes><divisions>1</divisions><time><beats>4</beats><beat-type>4</beat-type></time></attributes>
+    <note>
+      <pitch><step>C</step><octave>4</octave></pitch>
+      <duration>1</duration>
+      <type>quarter</type>
+      <lyric number="3"><syllabic>single</syllabic><text>You,</text></lyric>
+    </note>
+  </measure></part>
+</score-partwise>
+"#;
+
+        let result = convert_musicxml_to_scorify(
+            xml,
+            &ConversionOptions {
+                include_import: false,
+                ..ConversionOptions::default()
+            },
+        )
+        .unwrap();
+
+        assert!(result.contains("music: \"c4lll[You,]\""), "{result}");
     }
 
     #[test]
