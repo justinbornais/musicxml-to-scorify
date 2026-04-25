@@ -123,16 +123,17 @@ See `examples/browser.html` for a tiny file-upload example.
 
 ## Web Converter
 
-The static browser app lives in `web-converter/`. It uses the generated converter WASM package, loads the local Scorify Typst package from `typst/scorify`, and renders the generated Typst document through Typst.ts.
+The static browser app lives in `web-converter/`. It uses the generated converter WASM package, bundles the local Scorify Typst package at `web-converter/typst/scorify`, and renders the generated Typst document through Typst.ts. Generated Typst is normalized to import the local `lib.typ`.
 
-Serve the repository root:
+Serve the app directory:
 
 ```powershell
+cd web-converter
 python -m http.server 8787
 ```
 
 Then open:
 
 ```text
-http://localhost:8787/web-converter/
+http://localhost:8787/
 ```

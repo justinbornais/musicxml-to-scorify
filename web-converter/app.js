@@ -73,10 +73,14 @@ function classNames(...values) {
 }
 
 function typstDocument(scoreCall) {
+  const body = scoreCall
+    .replace(/#import\s+(?:"@preview\/scorify:[^"]+"|"[^"]*lib\.typ")\s*:\s*score\s*\n*/g, "")
+    .trim();
+
   return `#set page(margin: 16mm)
 #import "/scorify/lib.typ": score
 
-${scoreCall.trim()}
+${body}
 `;
 }
 
@@ -126,12 +130,14 @@ async function configureTypstRuntime() {
   });
 
   const [scorifyLib, scorifyWasm] = await Promise.all([
-    fetch("../typst/scorify/lib.typ").then((response) => {
-      if (!response.ok) throw new Error("Could not load typst/scorify/lib.typ");
+    fetch("./typst/scorify/lib.typ").then((response) => {
+      if (!response.ok) throw new Error("Could not load web-converter/typst/scorify/lib.typ");
       return response.text();
     }),
-    fetch("../typst/scorify/scorify_wasm.wasm").then((response) => {
-      if (!response.ok) throw new Error("Could not load typst/scorify/scorify_wasm.wasm");
+    fetch("./typst/scorify/scorify_wasm.wasm").then((response) => {
+      if (!response.ok) {
+        throw new Error("Could not load web-converter/typst/scorify/scorify_wasm.wasm");
+      }
       return response.arrayBuffer();
     }),
   ]);
