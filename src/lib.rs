@@ -1153,7 +1153,9 @@ fn harmony_text(harmony: Node<'_, '_>) -> Option<String> {
     let root = harmony.children().find(|node| node.has_tag_name("root"))?;
     let step = first_child_text(root, "root-step")?;
     let alter = first_child_i32(root, "root-alter").unwrap_or(0);
-    let kind = first_child_text(harmony, "kind").unwrap_or_default();
+    let kind_node = harmony.children().find(|node| node.has_tag_name("kind"));
+    let kind = kind_node.and_then(node_text).unwrap_or_default();
+    let kind_text = kind_node.and_then(|node| node.attribute("text"));
     let bass = harmony.children().find(|node| node.has_tag_name("bass"));
 
     let mut text = step;
@@ -1164,19 +1166,7 @@ fn harmony_text(harmony: Node<'_, '_>) -> Option<String> {
         -2 => "bb",
         _ => "",
     });
-    text.push_str(match kind.as_str() {
-        "major" => "",
-        "minor" => "m",
-        "dominant" => "7",
-        "major-seventh" => "maj7",
-        "minor-seventh" => "m7",
-        "diminished" => "dim",
-        "augmented" => "aug",
-        "suspended-fourth" => "sus4",
-        "suspended-second" => "sus2",
-        "none" => "",
-        other => other,
-    });
+    text.push_str(chord_kind_suffix(&kind, kind_text).as_str());
 
     if let Some(bass) = bass {
         if let Some(step) = first_child_text(bass, "bass-step") {
@@ -1193,6 +1183,48 @@ fn harmony_text(harmony: Node<'_, '_>) -> Option<String> {
     }
 
     Some(text)
+}
+
+fn chord_kind_suffix(kind: &str, text: Option<&str>) -> String {
+    if let Some(text) = text.map(str::trim).filter(|text| !text.is_empty()) {
+        return text.replace(' ', "");
+    }
+
+    match kind.trim() {
+        "" | "major" | "none" => "",
+        "minor" => "m",
+        "augmented" => "aug",
+        "diminished" => "dim",
+        "dominant" => "7",
+        "major-seventh" => "Maj7",
+        "minor-seventh" => "m7",
+        "diminished-seventh" => "dim7",
+        "augmented-seventh" => "aug7",
+        "half-diminished" => "m7b5",
+        "major-minor" => "mMaj7",
+        "major-sixth" => "6",
+        "minor-sixth" => "m6",
+        "dominant-ninth" => "9",
+        "major-ninth" => "Maj9",
+        "minor-ninth" => "m9",
+        "dominant-11th" => "11",
+        "major-11th" => "Maj11",
+        "minor-11th" => "m11",
+        "dominant-13th" => "13",
+        "major-13th" => "Maj13",
+        "minor-13th" => "m13",
+        "suspended-second" => "sus2",
+        "suspended-fourth" => "sus4",
+        "power" => "5",
+        "Neapolitan" => "N",
+        "Italian" => "It+6",
+        "French" => "Fr+6",
+        "German" => "Ger+6",
+        "Tristan" => "Tristan",
+        "other" => "",
+        other => other,
+    }
+    .to_string()
 }
 
 fn parse_lyric(lyric: Node<'_, '_>) -> Option<String> {
@@ -1573,6 +1605,41 @@ mod tests {
         .unwrap();
 
         assert!(result.contains("music: \"c4lll[You,]\""), "{result}");
+    }
+
+    #[test]
+    fn maps_musicxml_harmony_kinds_to_compact_chord_symbols() {
+        let xml = r#"
+<score-partwise version="4.0">
+  <part-list><score-part id="P1"><part-name>Lead Sheet</part-name></score-part></part-list>
+  <part id="P1"><measure number="1">
+    <attributes><divisions>1</divisions><time><beats>4</beats><beat-type>4</beat-type></time></attributes>
+    <harmony print-frame="no"><root><root-step>F</root-step></root><kind text="6">major-sixth</kind></harmony>
+    <note><pitch><step>C</step><octave>4</octave></pitch><duration>1</duration><type>quarter</type></note>
+    <harmony><root><root-step>C</root-step></root><kind>major-seventh</kind></harmony>
+    <note><pitch><step>D</step><octave>4</octave></pitch><duration>1</duration><type>quarter</type></note>
+    <harmony><root><root-step>C</root-step></root><kind>dominant</kind></harmony>
+    <note><pitch><step>E</step><octave>4</octave></pitch><duration>1</duration><type>quarter</type></note>
+    <harmony><root><root-step>C</root-step></root><kind>minor-seventh</kind></harmony>
+    <note><pitch><step>F</step><octave>4</octave></pitch><duration>1</duration><type>quarter</type></note>
+  </measure></part>
+</score-partwise>
+"#;
+
+        let result = convert_musicxml_to_scorify(
+            xml,
+            &ConversionOptions {
+                include_import: false,
+                ..ConversionOptions::default()
+            },
+        )
+        .unwrap();
+
+        assert!(
+            result.contains("music: \"c4[F6] d4[CMaj7] e4[C7] f4[Cm7]\""),
+            "{result}"
+        );
+        assert!(!result.contains("major-sixth"), "{result}");
     }
 
     #[test]
