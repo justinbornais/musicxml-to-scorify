@@ -9,6 +9,12 @@ export function convert_musicxml_text_with_options_wasm(xml: string, options_jso
 
 export function convert_musicxml_to_scorify_wasm(xml: string): string;
 
+export function convert_scorify_file_wasm(bytes: Uint8Array): string;
+
+export function convert_scorify_text_wasm(source: string): string;
+
+export function convert_scorify_to_musicxml_wasm(source: string): string;
+
 export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembly.Module;
 
 export interface InitOutput {
@@ -16,7 +22,10 @@ export interface InitOutput {
     readonly convert_musicxml_file_wasm: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
     readonly convert_musicxml_text_wasm: (a: number, b: number) => [number, number, number, number];
     readonly convert_musicxml_text_with_options_wasm: (a: number, b: number, c: number, d: number) => [number, number, number, number];
+    readonly convert_scorify_file_wasm: (a: number, b: number) => [number, number, number, number];
+    readonly convert_scorify_text_wasm: (a: number, b: number) => [number, number, number, number];
     readonly convert_musicxml_to_scorify_wasm: (a: number, b: number) => [number, number, number, number];
+    readonly convert_scorify_to_musicxml_wasm: (a: number, b: number) => [number, number, number, number];
     readonly __wbindgen_externrefs: WebAssembly.Table;
     readonly __wbindgen_malloc: (a: number, b: number) => number;
     readonly __wbindgen_realloc: (a: number, b: number, c: number, d: number) => number;

@@ -101,6 +101,11 @@ button {
   gap: 10px;
 }
 
+.topActions {
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
 .mark {
   width: 42px;
   height: 42px;
@@ -244,6 +249,15 @@ button:disabled {
   padding: 4px;
   border-radius: 8px;
   background: var(--segment);
+}
+
+.segments.twoUp {
+  grid-template-columns: repeat(2, 1fr);
+}
+
+.modeSwitch {
+  min-width: min(420px, 100%);
+  margin: 0;
 }
 
 .segments button {
@@ -433,7 +447,11 @@ button:disabled {
   .topActions {
     width: 100%;
     display: grid;
-    grid-template-columns: 1fr repeat(3, minmax(58px, auto));
+    grid-template-columns: 1fr repeat(4, minmax(58px, auto));
+  }
+
+  .modeSwitch {
+    min-width: 0;
   }
 
   .workspace {

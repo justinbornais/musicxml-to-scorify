@@ -8,6 +8,8 @@ use roxmltree::{Document, Node, ParsingOptions};
 use serde::Deserialize;
 use thiserror::Error;
 
+mod scorify_to_musicxml;
+
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
 
@@ -56,6 +58,8 @@ pub enum ConvertError {
     Xml(#[from] roxmltree::Error),
     #[error("MusicXML file is not valid UTF-8: {0}")]
     Utf8(#[from] FromUtf8Error),
+    #[error("Scorify input is not valid UTF-8: {0}")]
+    ScorifyUtf8(FromUtf8Error),
     #[error("failed to read compressed .mxl archive: {0}")]
     Zip(#[from] zip::result::ZipError),
     #[error("failed to read compressed .mxl archive entry: {0}")]
@@ -68,6 +72,10 @@ pub enum ConvertError {
     MissingScore,
     #[error("MusicXML score contains no parts")]
     NoParts,
+    #[error("Scorify input does not contain a #score(...) call")]
+    MissingScorifyScore,
+    #[error("invalid Scorify input: {0}")]
+    InvalidScorify(String),
 }
 
 pub fn convert_musicxml_to_scorify(
@@ -85,6 +93,15 @@ pub fn convert_musicxml_file_to_scorify(
 ) -> Result<String, ConvertError> {
     let xml = read_musicxml_bytes(bytes, filename)?;
     convert_musicxml_to_scorify(&xml, options)
+}
+
+pub fn convert_scorify_to_musicxml(source: &str) -> Result<String, ConvertError> {
+    scorify_to_musicxml::convert_scorify_to_musicxml(source)
+}
+
+pub fn convert_scorify_file_to_musicxml(bytes: &[u8]) -> Result<String, ConvertError> {
+    let source = String::from_utf8(bytes.to_vec()).map_err(ConvertError::ScorifyUtf8)?;
+    convert_scorify_to_musicxml(&source)
 }
 
 pub fn read_musicxml_bytes(bytes: &[u8], filename: &str) -> Result<String, ConvertError> {
@@ -138,12 +155,30 @@ pub fn convert_musicxml_file_wasm(
 }
 
 #[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn convert_scorify_to_musicxml_wasm(source: &str) -> Result<String, JsValue> {
+    convert_scorify_to_musicxml(source).map_err(js_error)
+}
+
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn convert_scorify_text_wasm(source: &str) -> Result<String, JsValue> {
+    convert_scorify_to_musicxml(source).map_err(js_error)
+}
+
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn convert_scorify_file_wasm(bytes: &[u8]) -> Result<String, JsValue> {
+    convert_scorify_file_to_musicxml(bytes).map_err(js_error)
+}
+
+#[cfg(target_arch = "wasm32")]
 fn js_error(error: ConvertError) -> JsValue {
     JsValue::from_str(&error.to_string())
 }
 
 #[derive(Debug, Clone, Default)]
-struct Score {
+pub(crate) struct Score {
     title: Option<String>,
     composer: Option<String>,
     key: Option<String>,
@@ -152,7 +187,7 @@ struct Score {
 }
 
 #[derive(Debug, Clone)]
-struct Staff {
+pub(crate) struct Staff {
     clef: String,
     music: String,
     instrument_name: Option<String>,
@@ -194,7 +229,7 @@ impl Default for PartState {
 }
 
 #[derive(Debug, Clone)]
-struct MeasureAcc {
+pub(crate) struct MeasureAcc {
     voices: BTreeMap<String, Vec<TimedEvent>>,
     controls: Vec<TimedEvent>,
 }
@@ -207,14 +242,14 @@ struct MeasureResult {
 }
 
 #[derive(Debug, Clone)]
-struct TimedEvent {
+pub(crate) struct TimedEvent {
     start: i32,
     duration: i32,
     token: Token,
 }
 
 #[derive(Debug, Clone)]
-enum Token {
+pub(crate) enum Token {
     Note(NoteToken),
     Rest,
     Clef(String),
@@ -222,12 +257,13 @@ enum Token {
 }
 
 #[derive(Debug, Clone)]
-struct NoteToken {
+pub(crate) struct NoteToken {
     clef: String,
     pitches: Vec<PitchToken>,
     duration_text: Option<String>,
     dots: usize,
     tie_start: bool,
+    tie_stop: bool,
     slur_start: bool,
     slur_stop: bool,
     dynamic: Option<String>,
@@ -238,7 +274,7 @@ struct NoteToken {
 }
 
 #[derive(Debug, Clone)]
-struct PitchToken {
+pub(crate) struct PitchToken {
     step: char,
     alter: i32,
     accidental_text: Option<String>,
@@ -246,7 +282,7 @@ struct PitchToken {
 }
 
 #[derive(Debug, Clone)]
-struct LyricToken {
+pub(crate) struct LyricToken {
     verse: Option<u32>,
     text: String,
 }
@@ -731,6 +767,12 @@ fn parse_note_token(
                 .attribute("type")
                 .is_some_and(|kind| kind.eq_ignore_ascii_case("start"))
     });
+    let tie_stop = note.children().any(|node| {
+        node.has_tag_name("tie")
+            && node
+                .attribute("type")
+                .is_some_and(|kind| kind.eq_ignore_ascii_case("stop"))
+    });
 
     let dots = note
         .children()
@@ -749,6 +791,7 @@ fn parse_note_token(
         duration_text: first_child_text(note, "type").and_then(|kind| type_to_duration(&kind)),
         dots,
         tie_start,
+        tie_stop,
         slur_start,
         slur_stop,
         dynamic: pending.dynamic,
@@ -1318,7 +1361,7 @@ fn staff_from_voice(voice: Option<&str>) -> Option<usize> {
     if voice >= 5 { Some(2) } else { Some(1) }
 }
 
-fn clef_base_octave(clef: &str) -> i32 {
+pub(crate) fn clef_base_octave(clef: &str) -> i32 {
     if clef.starts_with("bass") { 3 } else { 4 }
 }
 
@@ -1756,4 +1799,90 @@ mod tests {
         assert!(result.contains("title: \"Tiny Tune\""));
         assert!(result.contains("music: \"<f# a>4v[mf]l[Joy] r4\""));
     }
+
+        #[test]
+        fn converts_scorify_score_back_to_musicxml() {
+                let typst = r#"
+#import "@preview/scorify:0.3.0": score
+
+#score(
+    title: "Simple Scorify Sample",
+    composer: "MusicXML Fixture",
+    key: "C",
+    time: "4/4",
+    staves: (
+        (
+            clef: "treble",
+            instrument-name: "Flute",
+            instrument-name-cont: "Fl.",
+            music: "c4v[mf]l[Hel-] d4l[lo] e4*[G7] r4 |: f2~ f2 :|",
+        ),
+    ),
+)
+"#;
+
+                let result = convert_scorify_to_musicxml(typst).unwrap();
+
+                assert!(result.contains("<work-title>Simple Scorify Sample</work-title>"), "{result}");
+                assert!(result.contains("<creator type=\"composer\">MusicXML Fixture</creator>"), "{result}");
+                assert!(result.contains("<part-name>Flute</part-name>"), "{result}");
+                assert!(result.contains("<dynamics><mf/></dynamics>"), "{result}");
+                assert!(result.contains("<kind text=\"7\">other</kind>"), "{result}");
+                assert!(result.contains("<repeat direction=\"forward\"/>"), "{result}");
+                assert!(result.contains("<tie type=\"start\"/>"), "{result}");
+                assert!(result.contains("<tie type=\"stop\"/>"), "{result}");
+        }
+
+        #[test]
+        fn round_trips_grand_staff_and_secondary_voice() {
+                let xml = r#"
+<score-partwise version="4.0">
+    <work><work-title>Tiny Tune</work-title></work>
+    <identification><creator type="composer">A. Composer</creator></identification>
+    <part-list>
+        <score-part id="P1"><part-name>Piano</part-name><part-abbreviation>Pno.</part-abbreviation></score-part>
+    </part-list>
+    <part id="P1">
+        <measure number="1">
+            <attributes>
+                <divisions>2</divisions>
+                <key><fifths>2</fifths></key>
+                <time><beats>4</beats><beat-type>4</beat-type></time>
+                <staves>2</staves>
+                <clef number="1"><sign>G</sign><line>2</line></clef>
+                <clef number="2"><sign>F</sign><line>4</line></clef>
+            </attributes>
+            <note>
+                <pitch><step>C</step><octave>4</octave></pitch>
+                <duration>2</duration><voice>1</voice><type>quarter</type><staff>1</staff>
+            </note>
+            <backup><duration>2</duration></backup>
+            <note>
+                <rest/><duration>2</duration><voice>2</voice><type>quarter</type><staff>1</staff>
+            </note>
+            <note>
+                <pitch><step>D</step><octave>3</octave></pitch>
+                <duration>4</duration><voice>1</voice><type>half</type><staff>2</staff>
+            </note>
+        </measure>
+    </part>
+</score-partwise>
+"#;
+
+                let typst = convert_musicxml_to_scorify(
+                        xml,
+                        &ConversionOptions {
+                                include_import: false,
+                                ..ConversionOptions::default()
+                        },
+                )
+                .unwrap();
+                let result = convert_scorify_to_musicxml(&typst).unwrap();
+
+                assert!(result.contains("<staves>2</staves>"), "{result}");
+                assert!(result.contains("<clef number=\"2\"><sign>F</sign><line>4</line></clef>"), "{result}");
+                assert!(result.contains("<backup><duration>768</duration></backup>"), "{result}");
+                assert!(result.contains("<voice>2</voice>"), "{result}");
+                assert!(result.contains("<staff>2</staff>"), "{result}");
+        }
 }

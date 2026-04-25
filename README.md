@@ -1,14 +1,15 @@
 # musicxml-to-scorify
 
-Convert MusicXML files into Typst [Scorify](https://github.com/justinbornais/typst-sheet-music) `#score(...)` calls.
+Convert MusicXML files into Typst [Scorify](https://github.com/justinbornais/typst-sheet-music) `#score(...)` calls, and convert Scorify scores back into MusicXML.
 
-The converter is written in Rust. The conversion core is shared by the CLI and the WASM build, so browser callers can convert pasted MusicXML text or uploaded `.musicxml`/`.xml`/`.mxl` files into Typst code.
+The converter is written in Rust. The conversion core is shared by the CLI and the WASM build, so browser callers can convert pasted MusicXML text or uploaded `.musicxml`/`.xml`/`.mxl` files into Typst code, or turn Scorify input back into MusicXML.
 
 ## Usage
 
 ```powershell
 cargo run -- samples/simple.musicxml
 cargo run -- samples/grand-staff.musicxml --output out.typ
+cargo run -- samples/Hear, O Lord.typ --from scorify --output out.musicxml
 ```
 
 By default the output includes:
@@ -23,7 +24,10 @@ Useful options:
 cargo run -- score.musicxml --no-import
 cargo run -- score.musicxml --measures-per-line 4
 cargo run -- score.mxl --output score.typ
+cargo run -- score.typ --from scorify --output score.musicxml
 ```
+
+`--from` accepts `auto`, `musicxml`, and `scorify`. `auto` is the default and detects common file extensions plus `#score(` or `<score-partwise` content.
 
 ## Supported Conversion Surface
 
@@ -35,6 +39,8 @@ cargo run -- score.mxl --output score.typ
 - Regular, double, final, forward-repeat, and backward-repeat barlines
 - Plain `.musicxml`/`.xml` files and compressed `.mxl` archives
 
+The reverse Scorify parser targets the same score properties and music tokens that this project emits in the MusicXML -> Scorify direction, so round-tripping preserves the supported subset instead of attempting to parse arbitrary Typst programs.
+
 The Scorify output intentionally stays textual and editable. Unsupported MusicXML details are skipped rather than encoded as opaque comments.
 
 ## Library Entry Points
@@ -43,6 +49,8 @@ The Scorify output intentionally stays textual and editable. Unsupported MusicXM
 use musicxml_to_scorify::{
     convert_musicxml_file_to_scorify,
     convert_musicxml_to_scorify,
+  convert_scorify_file_to_musicxml,
+  convert_scorify_to_musicxml,
     ConversionOptions,
 };
 
@@ -52,6 +60,8 @@ let typst_from_file = convert_musicxml_file_to_scorify(
     "score.mxl",
     &ConversionOptions::default(),
 )?;
+  let musicxml = convert_scorify_to_musicxml(typst_source)?;
+  let musicxml_from_file = convert_scorify_file_to_musicxml(typst_bytes)?;
 ```
 
 ## WASM Build
@@ -83,6 +93,8 @@ The generated module exposes:
 convert_musicxml_text_wasm(xml)
 convert_musicxml_text_with_options_wasm(xml, optionsJson)
 convert_musicxml_file_wasm(bytes, filename, optionsJson)
+convert_scorify_text_wasm(source)
+convert_scorify_file_wasm(bytes)
 ```
 
 `optionsJson` uses camelCase keys:
@@ -102,6 +114,8 @@ Browser example:
 import init, {
   convert_musicxml_file_wasm,
   convert_musicxml_text_with_options_wasm,
+  convert_scorify_file_wasm,
+  convert_scorify_text_wasm,
 } from "./pkg/musicxml_to_scorify.js";
 
 await init();
@@ -117,13 +131,16 @@ const typstFromFile = convert_musicxml_file_wasm(
   file.name,
   JSON.stringify({ includeImport: true }),
 );
+
+const musicXmlFromText = convert_scorify_text_wasm(scorifySource);
+const musicXmlFromFile = convert_scorify_file_wasm(bytes);
 ```
 
 See `examples/browser.html` for a tiny file-upload example.
 
 ## Web Converter
 
-The static browser app lives in `web-converter/`. It uses the generated converter WASM package, bundles the local Scorify Typst package at `web-converter/typst/scorify`, and renders the generated Typst document through Typst.ts. Generated Typst is normalized to import the local `lib.typ`.
+The static browser app lives in `web-converter/`. It uses the generated converter WASM package, bundles the local Scorify Typst package at `web-converter/typst/scorify`, and renders Scorify documents through Typst.ts. The UI supports both MusicXML -> Scorify and Scorify -> MusicXML, and keeps the preview focused on the Scorify side of the conversion.
 
 Serve the app directory:
 
