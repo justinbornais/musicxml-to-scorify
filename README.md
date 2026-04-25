@@ -120,3 +120,19 @@ const typstFromFile = convert_musicxml_file_wasm(
 ```
 
 See `examples/browser.html` for a tiny file-upload example.
+
+## Web Converter
+
+The static browser app lives in `web-converter/`. It uses the generated converter WASM package, loads the local Scorify Typst package from `typst/scorify`, and renders the generated Typst document through Typst.ts.
+
+Serve the repository root:
+
+```powershell
+python -m http.server 8787
+```
+
+Then open:
+
+```text
+http://localhost:8787/web-converter/
+```
