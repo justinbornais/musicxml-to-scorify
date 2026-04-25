@@ -1,0 +1,1322 @@
+use std::collections::{BTreeMap, HashMap};
+
+use roxmltree::{Document, Node, ParsingOptions};
+use thiserror::Error;
+
+#[cfg(target_arch = "wasm32")]
+use wasm_bindgen::prelude::*;
+
+#[derive(Debug, Clone)]
+pub struct ConversionOptions {
+    pub include_import: bool,
+    pub package: String,
+    pub measures_per_line: Option<u32>,
+    pub include_comment: bool,
+}
+
+impl Default for ConversionOptions {
+    fn default() -> Self {
+        Self {
+            include_import: true,
+            package: "@preview/scorify:0.3.0".to_string(),
+            measures_per_line: None,
+            include_comment: false,
+        }
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum ConvertError {
+    #[error("invalid MusicXML: {0}")]
+    Xml(#[from] roxmltree::Error),
+    #[error("MusicXML document does not contain a score-partwise root")]
+    MissingScore,
+    #[error("MusicXML score contains no parts")]
+    NoParts,
+}
+
+pub fn convert_musicxml_to_scorify(
+    xml: &str,
+    options: &ConversionOptions,
+) -> Result<String, ConvertError> {
+    let score = parse_musicxml(xml)?;
+    Ok(emit_typst(&score, options))
+}
+
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn convert_musicxml_to_scorify_wasm(xml: &str) -> Result<String, JsValue> {
+    convert_musicxml_to_scorify(xml, &ConversionOptions::default())
+        .map_err(|err| JsValue::from_str(&err.to_string()))
+}
+
+#[derive(Debug, Clone, Default)]
+struct Score {
+    title: Option<String>,
+    composer: Option<String>,
+    key: Option<String>,
+    time: Option<String>,
+    staves: Vec<Staff>,
+}
+
+#[derive(Debug, Clone)]
+struct Staff {
+    clef: String,
+    music: String,
+    instrument_name: Option<String>,
+    instrument_name_cont: Option<String>,
+    brace_start: bool,
+    brace_end: bool,
+    bracket_start: bool,
+    bracket_end: bool,
+}
+
+#[derive(Debug, Clone)]
+struct PartInfo {
+    id: String,
+    name: Option<String>,
+    abbreviation: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct PartState {
+    divisions: i32,
+    key: Option<String>,
+    time: Option<String>,
+    staves: usize,
+    clefs: BTreeMap<usize, String>,
+}
+
+impl Default for PartState {
+    fn default() -> Self {
+        let mut clefs = BTreeMap::new();
+        clefs.insert(1, "treble".to_string());
+        Self {
+            divisions: 1,
+            key: None,
+            time: None,
+            staves: 1,
+            clefs,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct MeasureAcc {
+    voices: BTreeMap<String, Vec<TimedEvent>>,
+    controls: Vec<TimedEvent>,
+}
+
+#[derive(Debug, Clone)]
+struct MeasureResult {
+    staves: BTreeMap<usize, MeasureAcc>,
+    barline_before: Option<String>,
+    barline_after: String,
+}
+
+#[derive(Debug, Clone)]
+struct TimedEvent {
+    start: i32,
+    duration: i32,
+    token: Token,
+}
+
+#[derive(Debug, Clone)]
+enum Token {
+    Note(NoteToken),
+    Rest,
+    Clef(String),
+    Time(String),
+}
+
+#[derive(Debug, Clone)]
+struct NoteToken {
+    clef: String,
+    pitches: Vec<PitchToken>,
+    duration_text: Option<String>,
+    dots: usize,
+    tie_start: bool,
+    slur_start: bool,
+    slur_stop: bool,
+    dynamic: Option<String>,
+    chord_symbol: Option<String>,
+    staff_text: Option<String>,
+    lyric: Option<String>,
+    articulations: Vec<&'static str>,
+}
+
+#[derive(Debug, Clone)]
+struct PitchToken {
+    step: char,
+    alter: i32,
+    accidental_text: Option<String>,
+    octave: i32,
+}
+
+#[derive(Debug, Clone, Default)]
+struct PendingAttachment {
+    dynamic: Option<String>,
+    staff_text: Option<String>,
+    chord_symbol: Option<String>,
+}
+
+fn parse_musicxml(xml: &str) -> Result<Score, ConvertError> {
+    let doc = parse_musicxml_document(xml)?;
+    let root = doc
+        .descendants()
+        .find(|node| node.has_tag_name("score-partwise"))
+        .ok_or(ConvertError::MissingScore)?;
+
+    let part_infos = collect_part_infos(root);
+    let part_by_id: HashMap<&str, &PartInfo> = part_infos
+        .iter()
+        .map(|part| (part.id.as_str(), part))
+        .collect();
+
+    let mut score = Score {
+        title: first_child_text(root, "movement-title")
+            .or_else(|| first_descendant_text(root, "work-title")),
+        composer: root
+            .descendants()
+            .find(|node| {
+                node.has_tag_name("creator")
+                    && node
+                        .attribute("type")
+                        .is_some_and(|kind| kind.eq_ignore_ascii_case("composer"))
+            })
+            .and_then(node_text),
+        ..Score::default()
+    };
+
+    let parts: Vec<_> = root
+        .children()
+        .filter(|node| node.is_element() && node.has_tag_name("part"))
+        .collect();
+
+    if parts.is_empty() {
+        return Err(ConvertError::NoParts);
+    }
+
+    for part_node in parts {
+        let part_id = part_node.attribute("id").unwrap_or("");
+        let part_info = part_by_id.get(part_id).copied();
+        let mut state = PartState::default();
+        let part_staves = parse_part(part_node, &mut state);
+
+        let is_grand_staff = part_staves.len() == 2
+            && matches!(part_staves.first().map(|s| s.clef.as_str()), Some("treble"))
+            && matches!(part_staves.get(1).map(|s| s.clef.as_str()), Some("bass"));
+
+        for (index, mut staff) in part_staves.into_iter().enumerate() {
+            if index == 0 {
+                staff.instrument_name = part_info.and_then(|p| p.name.clone());
+                staff.instrument_name_cont = part_info.and_then(|p| p.abbreviation.clone());
+            }
+            if is_grand_staff {
+                staff.brace_start = index == 0;
+                staff.brace_end = index == 1;
+            } else if state.staves > 1 {
+                staff.bracket_start = index == 0;
+                staff.bracket_end = index + 1 == state.staves;
+            }
+            score.staves.push(staff);
+        }
+
+        if score.key.is_none() {
+            score.key = state.key.clone();
+        }
+        if score.time.is_none() {
+            score.time = state.time.clone();
+        }
+    }
+
+    Ok(score)
+}
+
+fn parse_musicxml_document(xml: &str) -> Result<Document<'_>, roxmltree::Error> {
+    Document::parse_with_options(
+        xml.trim_start_matches('\u{feff}').trim_start(),
+        ParsingOptions {
+            allow_dtd: true,
+            ..ParsingOptions::default()
+        },
+    )
+}
+
+fn collect_part_infos(root: Node<'_, '_>) -> Vec<PartInfo> {
+    root.children()
+        .find(|node| node.has_tag_name("part-list"))
+        .into_iter()
+        .flat_map(|part_list| {
+            part_list
+                .children()
+                .filter(|node| node.is_element() && node.has_tag_name("score-part"))
+        })
+        .map(|part| PartInfo {
+            id: part.attribute("id").unwrap_or("").to_string(),
+            name: first_child_text(part, "part-name"),
+            abbreviation: first_child_text(part, "part-abbreviation"),
+        })
+        .collect()
+}
+
+fn parse_part(part_node: Node<'_, '_>, state: &mut PartState) -> Vec<Staff> {
+    let mut staff_music: BTreeMap<usize, Vec<(String, String)>> = BTreeMap::new();
+
+    for measure in part_node
+        .children()
+        .filter(|node| node.is_element() && node.has_tag_name("measure"))
+    {
+        let measure_result = parse_measure(measure, state);
+
+        for staff_no in 1..=state.staves.max(1) {
+            let acc = measure_result
+                .staves
+                .get(&staff_no)
+                .cloned()
+                .unwrap_or_else(|| MeasureAcc {
+                    voices: BTreeMap::new(),
+                    controls: Vec::new(),
+                });
+            let mut measure_text = emit_measure(&acc, state.divisions);
+            if let Some(before) = &measure_result.barline_before {
+                measure_text = if measure_text.is_empty() {
+                    before.clone()
+                } else {
+                    format!("{before} {measure_text}")
+                };
+            }
+            if !measure_text.is_empty() {
+                staff_music
+                    .entry(staff_no)
+                    .or_default()
+                    .push((measure_text, measure_result.barline_after.clone()));
+            }
+        }
+    }
+
+    for staff_no in 1..=state.staves.max(1) {
+        staff_music.entry(staff_no).or_default();
+    }
+
+    staff_music
+        .into_iter()
+        .map(|(staff_no, measures)| {
+            let music = measures.iter().enumerate().fold(
+                String::new(),
+                |mut acc, (idx, (measure, barline))| {
+                    if idx > 0 {
+                        acc.push(' ');
+                    }
+                    acc.push_str(measure);
+                    let next_starts_with_left_repeat = measures
+                        .get(idx + 1)
+                        .is_some_and(|(next, _)| next.starts_with("|:"));
+                    if (idx + 1 < measures.len()
+                        && !(barline == "|" && next_starts_with_left_repeat))
+                        || barline != "|"
+                    {
+                        acc.push(' ');
+                        acc.push_str(barline);
+                    }
+                    acc
+                },
+            );
+
+            Staff {
+                clef: state
+                    .clefs
+                    .get(&staff_no)
+                    .cloned()
+                    .unwrap_or_else(|| "treble".to_string()),
+                music,
+                instrument_name: None,
+                instrument_name_cont: None,
+                brace_start: false,
+                brace_end: false,
+                bracket_start: false,
+                bracket_end: false,
+            }
+        })
+        .collect()
+}
+
+fn parse_measure(measure: Node<'_, '_>, state: &mut PartState) -> MeasureResult {
+    let mut cursor = 0;
+    let mut last_note_key: Option<(usize, String, i32)> = None;
+    let mut pending = PendingAttachment::default();
+    let mut accs: BTreeMap<usize, MeasureAcc> = BTreeMap::new();
+    let mut barline_before = None;
+    let mut barline_after = "|".to_string();
+
+    for child in measure.children().filter(|node| node.is_element()) {
+        match child.tag_name().name() {
+            "attributes" => {
+                parse_attributes(child, state, cursor, &mut accs);
+            }
+            "backup" => {
+                cursor = (cursor - first_child_i32(child, "duration").unwrap_or(0)).max(0);
+                last_note_key = None;
+            }
+            "forward" => {
+                cursor += first_child_i32(child, "duration").unwrap_or(0);
+                last_note_key = None;
+            }
+            "direction" => {
+                collect_direction(child, &mut pending);
+            }
+            "harmony" => {
+                pending.chord_symbol = harmony_text(child);
+            }
+            "note" => {
+                let is_chord = child.children().any(|node| node.has_tag_name("chord"));
+                let staff_no = first_child_usize(child, "staff")
+                    .or_else(|| staff_from_voice(first_child_text(child, "voice").as_deref()))
+                    .unwrap_or(1);
+                let voice = first_child_text(child, "voice").unwrap_or_else(|| "1".to_string());
+                let duration = first_child_i32(child, "duration").unwrap_or(0);
+                let start = if is_chord {
+                    last_note_key
+                        .as_ref()
+                        .filter(|(staff, last_voice, _)| *staff == staff_no && last_voice == &voice)
+                        .map(|(_, _, start)| *start)
+                        .unwrap_or(cursor)
+                } else {
+                    cursor
+                };
+
+                let token = parse_note_token(child, state, staff_no, pending.clone());
+                pending = PendingAttachment::default();
+
+                let acc = accs.entry(staff_no).or_insert_with(|| MeasureAcc {
+                    voices: BTreeMap::new(),
+                    controls: Vec::new(),
+                });
+
+                if let Some(Token::Note(note)) = token.as_ref() {
+                    if is_chord {
+                        if let Some(last) = acc
+                            .voices
+                            .get_mut(&voice)
+                            .and_then(|events| events.last_mut())
+                            .filter(|event| event.start == start)
+                        {
+                            if let Token::Note(existing) = &mut last.token {
+                                existing.pitches.extend(note.pitches.clone());
+                            }
+                        }
+                    } else {
+                        acc.voices
+                            .entry(voice.clone())
+                            .or_default()
+                            .push(TimedEvent {
+                                start,
+                                duration,
+                                token: Token::Note(note.clone()),
+                            });
+                    }
+                } else if let Some(token) = token {
+                    acc.voices
+                        .entry(voice.clone())
+                        .or_default()
+                        .push(TimedEvent {
+                            start,
+                            duration,
+                            token,
+                        });
+                }
+
+                if !is_chord {
+                    cursor += duration;
+                    last_note_key = Some((staff_no, voice, start));
+                }
+            }
+            "barline" => {
+                let barline = parse_barline(child);
+                if child.attribute("location") == Some("left") {
+                    barline_before = Some(barline);
+                } else {
+                    barline_after = barline;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    MeasureResult {
+        staves: accs,
+        barline_before,
+        barline_after,
+    }
+}
+
+fn parse_attributes(
+    attrs: Node<'_, '_>,
+    state: &mut PartState,
+    cursor: i32,
+    accs: &mut BTreeMap<usize, MeasureAcc>,
+) {
+    if let Some(divisions) = first_child_i32(attrs, "divisions") {
+        state.divisions = divisions.max(1);
+    }
+    if let Some(staves) = first_child_usize(attrs, "staves") {
+        state.staves = state.staves.max(staves.max(1));
+    }
+    if let Some(key_node) = attrs.children().find(|node| node.has_tag_name("key")) {
+        if let Some(key) = parse_key(key_node) {
+            state.key = Some(key);
+        }
+    }
+    if let Some(time_node) = attrs.children().find(|node| node.has_tag_name("time")) {
+        if let Some(time) = parse_time(time_node) {
+            let is_change = state
+                .time
+                .as_deref()
+                .is_some_and(|previous| previous != time);
+            state.time = Some(time.clone());
+            if is_change {
+                for staff_no in 1..=state.staves.max(1) {
+                    accs.entry(staff_no)
+                        .or_insert_with(|| MeasureAcc {
+                            voices: BTreeMap::new(),
+                            controls: Vec::new(),
+                        })
+                        .controls
+                        .push(TimedEvent {
+                            start: cursor,
+                            duration: 0,
+                            token: Token::Time(time.clone()),
+                        });
+                }
+            }
+        }
+    }
+
+    for clef_node in attrs.children().filter(|node| node.has_tag_name("clef")) {
+        let staff_no = clef_node
+            .attribute("number")
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(1);
+        let clef = parse_clef(clef_node);
+        let old = state.clefs.insert(staff_no, clef.clone());
+        if old.as_deref().is_some_and(|previous| previous != clef) {
+            accs.entry(staff_no)
+                .or_insert_with(|| MeasureAcc {
+                    voices: BTreeMap::new(),
+                    controls: Vec::new(),
+                })
+                .controls
+                .push(TimedEvent {
+                    start: cursor,
+                    duration: 0,
+                    token: Token::Clef(clef),
+                });
+        }
+    }
+}
+
+fn parse_note_token(
+    note: Node<'_, '_>,
+    state: &PartState,
+    staff_no: usize,
+    pending: PendingAttachment,
+) -> Option<Token> {
+    if note.children().any(|node| node.has_tag_name("rest")) {
+        return Some(Token::Rest);
+    }
+
+    let pitch_node = note.children().find(|node| node.has_tag_name("pitch"))?;
+    let step = first_child_text(pitch_node, "step")?
+        .chars()
+        .next()
+        .unwrap_or('C')
+        .to_ascii_lowercase();
+    let alter = first_child_i32(pitch_node, "alter").unwrap_or(0);
+    let octave = first_child_i32(pitch_node, "octave").unwrap_or_else(|| {
+        clef_base_octave(
+            state
+                .clefs
+                .get(&staff_no)
+                .map(String::as_str)
+                .unwrap_or("treble"),
+        )
+    });
+    let accidental_text = first_child_text(note, "accidental");
+    let clef = state
+        .clefs
+        .get(&staff_no)
+        .cloned()
+        .unwrap_or_else(|| "treble".to_string());
+
+    let notations = note.children().find(|node| node.has_tag_name("notations"));
+    let slur_start = notations.is_some_and(|notations| {
+        notations.descendants().any(|node| {
+            node.has_tag_name("slur")
+                && node
+                    .attribute("type")
+                    .is_some_and(|kind| kind.eq_ignore_ascii_case("start"))
+        })
+    });
+    let slur_stop = notations.is_some_and(|notations| {
+        notations.descendants().any(|node| {
+            node.has_tag_name("slur")
+                && node
+                    .attribute("type")
+                    .is_some_and(|kind| kind.eq_ignore_ascii_case("stop"))
+        })
+    });
+
+    let articulations = notations
+        .into_iter()
+        .flat_map(|notations| notations.descendants())
+        .filter_map(|node| match node.tag_name().name() {
+            "accent" => Some(">"),
+            "staccato" => Some("*"),
+            "tenuto" => Some("-"),
+            "fermata" => Some("_"),
+            _ => None,
+        })
+        .collect();
+
+    let tie_start = note.children().any(|node| {
+        node.has_tag_name("tie")
+            && node
+                .attribute("type")
+                .is_some_and(|kind| kind.eq_ignore_ascii_case("start"))
+    });
+
+    let dots = note
+        .children()
+        .filter(|node| node.has_tag_name("dot"))
+        .count();
+    let lyric = note
+        .children()
+        .find(|node| node.has_tag_name("lyric"))
+        .and_then(parse_lyric);
+
+    Some(Token::Note(NoteToken {
+        clef,
+        pitches: vec![PitchToken {
+            step,
+            alter,
+            accidental_text,
+            octave,
+        }],
+        duration_text: first_child_text(note, "type").and_then(|kind| type_to_duration(&kind)),
+        dots,
+        tie_start,
+        slur_start,
+        slur_stop,
+        dynamic: pending.dynamic,
+        chord_symbol: pending.chord_symbol,
+        staff_text: pending.staff_text,
+        lyric,
+        articulations,
+    }))
+}
+
+fn collect_direction(direction: Node<'_, '_>, pending: &mut PendingAttachment) {
+    for direction_type in direction
+        .children()
+        .filter(|node| node.has_tag_name("direction-type"))
+    {
+        if let Some(dynamic) = direction_type
+            .descendants()
+            .find(|node| {
+                matches!(
+                    node.tag_name().name(),
+                    "pppppp"
+                        | "ppppp"
+                        | "pppp"
+                        | "ppp"
+                        | "pp"
+                        | "p"
+                        | "mp"
+                        | "mf"
+                        | "f"
+                        | "ff"
+                        | "fff"
+                        | "ffff"
+                        | "fp"
+                        | "sf"
+                        | "sfp"
+                        | "sfz"
+                        | "rfz"
+                )
+            })
+            .map(|node| node.tag_name().name().to_string())
+        {
+            pending.dynamic = Some(dynamic);
+        }
+
+        if let Some(words) = direction_type
+            .children()
+            .find(|node| node.has_tag_name("words"))
+            .and_then(node_text)
+        {
+            pending.staff_text = Some(words);
+        }
+    }
+}
+
+fn emit_measure(acc: &MeasureAcc, divisions: i32) -> String {
+    let mut controls = acc.controls.clone();
+    controls.sort_by_key(|event| event.start);
+
+    if acc.voices.is_empty() {
+        return controls
+            .iter()
+            .map(|event| token_to_string(event, divisions))
+            .collect::<Vec<_>>()
+            .join(" ");
+    }
+
+    let mut voice_entries: Vec<_> = acc.voices.iter().collect();
+    voice_entries.sort_by_key(|(voice, _)| voice.parse::<u32>().unwrap_or(u32::MAX));
+
+    if voice_entries.len() == 1 {
+        let (_, events) = voice_entries[0];
+        emit_voice(events, &controls, divisions)
+    } else {
+        let upper = emit_voice(voice_entries[0].1, &controls, divisions);
+        let lower = emit_voice(voice_entries[1].1, &[], divisions);
+        format!("v{{{};{}}}", upper.trim(), lower.trim())
+    }
+}
+
+fn emit_voice(events: &[TimedEvent], controls: &[TimedEvent], divisions: i32) -> String {
+    let mut pieces = Vec::new();
+    let mut sorted = events.to_vec();
+    sorted.sort_by_key(|event| event.start);
+
+    let mut control_idx = 0;
+    let mut cursor = 0;
+
+    for event in sorted {
+        while control_idx < controls.len() && controls[control_idx].start <= event.start {
+            pieces.push(token_to_string(&controls[control_idx], divisions));
+            control_idx += 1;
+        }
+        if event.start > cursor {
+            pieces.extend(duration_to_tokens("s", event.start - cursor, divisions));
+        }
+        pieces.push(token_to_string(&event, divisions));
+        cursor = cursor.max(event.start + event.duration);
+    }
+
+    while control_idx < controls.len() {
+        pieces.push(token_to_string(&controls[control_idx], divisions));
+        control_idx += 1;
+    }
+
+    pieces
+        .into_iter()
+        .filter(|piece| !piece.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn token_to_string(event: &TimedEvent, divisions: i32) -> String {
+    match &event.token {
+        Token::Note(note) => note_to_string(note, event.duration, divisions),
+        Token::Rest => duration_to_tokens("r", event.duration, divisions).join(" "),
+        Token::Clef(clef) => clef.clone(),
+        Token::Time(time) => time.clone(),
+    }
+}
+
+fn note_to_string(note: &NoteToken, duration: i32, divisions: i32) -> String {
+    let (duration_text, dots) = if let Some(duration_text) = &note.duration_text {
+        (duration_text.clone(), ".".repeat(note.dots))
+    } else {
+        (
+            duration_to_text(duration, divisions).unwrap_or_else(|| "4".to_string()),
+            String::new(),
+        )
+    };
+    let pitch_text = if note.pitches.len() == 1 {
+        pitch_to_string(&note.pitches[0], &note.clef)
+    } else {
+        format!(
+            "<{}>",
+            note.pitches
+                .iter()
+                .map(|pitch| pitch_to_string(pitch, &note.clef))
+                .collect::<Vec<_>>()
+                .join(" ")
+        )
+    };
+
+    let mut token = format!("{pitch_text}{duration_text}{dots}");
+    if note.slur_start {
+        token.push('(');
+    }
+    for articulation in &note.articulations {
+        token.push_str(articulation);
+    }
+    if note.tie_start {
+        token.push('~');
+    }
+    if note.slur_stop {
+        token.push(')');
+    }
+    if let Some(dynamic) = &note.dynamic {
+        token.push_str("v[");
+        token.push_str(&escape_inline(dynamic));
+        token.push(']');
+    }
+    if let Some(text) = &note.staff_text {
+        token.push_str("text[");
+        token.push_str(&escape_inline(text));
+        token.push(']');
+    }
+    if let Some(chord) = &note.chord_symbol {
+        token.push('[');
+        token.push_str(&escape_inline(chord));
+        token.push(']');
+    }
+    if let Some(lyric) = &note.lyric {
+        token.push_str("l[");
+        token.push_str(&escape_inline(lyric));
+        token.push(']');
+    }
+
+    token
+}
+
+fn pitch_to_string(pitch: &PitchToken, clef: &str) -> String {
+    let mut out = String::new();
+    out.push(pitch.step);
+    out.push_str(accidental_to_scorify(
+        pitch.alter,
+        pitch.accidental_text.as_deref(),
+    ));
+
+    let base = clef_base_octave(clef);
+    let delta = pitch.octave - base;
+    if delta > 0 {
+        out.push_str(&"'".repeat(delta as usize));
+    } else if delta < 0 {
+        out.push_str(&",".repeat((-delta) as usize));
+    }
+    out
+}
+
+fn accidental_to_scorify(alter: i32, accidental: Option<&str>) -> &'static str {
+    match accidental.unwrap_or("").to_ascii_lowercase().as_str() {
+        "sharp" => "#",
+        "double-sharp" | "sharp-sharp" => "##",
+        "flat" => "&",
+        "flat-flat" | "double-flat" => "&&",
+        "natural" => "=",
+        _ => match alter {
+            2 => "##",
+            1 => "#",
+            -1 => "&",
+            -2 => "&&",
+            _ => "",
+        },
+    }
+}
+
+fn duration_to_tokens(prefix: &str, mut ticks: i32, divisions: i32) -> Vec<String> {
+    let mut out = Vec::new();
+    while ticks > 0 {
+        if let Some(duration) = duration_to_text(ticks, divisions) {
+            out.push(format!("{prefix}{duration}"));
+            break;
+        }
+
+        let mut emitted = false;
+        for denom in [1, 2, 4, 8, 16, 32, 64, 128] {
+            let unit_num = 4 * divisions;
+            if unit_num % denom == 0 {
+                let unit = unit_num / denom;
+                if unit > 0 && unit <= ticks {
+                    out.push(format!(
+                        "{prefix}{}",
+                        duration_name(denom).unwrap_or_else(|| denom.to_string())
+                    ));
+                    ticks -= unit;
+                    emitted = true;
+                    break;
+                }
+            }
+        }
+        if !emitted {
+            out.push(format!("{prefix}4"));
+            break;
+        }
+    }
+    out
+}
+
+fn duration_to_text(ticks: i32, divisions: i32) -> Option<String> {
+    if ticks <= 0 || divisions <= 0 {
+        return None;
+    }
+    let whole_num = 4 * divisions;
+    for denom in [1, 2, 4, 8, 16, 32, 64, 128] {
+        for dots in 0..=3 {
+            let multiplier_num = (1 << (dots + 1)) - 1;
+            let multiplier_den = 1 << dots;
+            if whole_num * multiplier_num == ticks * denom * multiplier_den {
+                let mut text = duration_name(denom).unwrap_or_else(|| denom.to_string());
+                text.push_str(&".".repeat(dots as usize));
+                return Some(text);
+            }
+        }
+    }
+    None
+}
+
+fn duration_name(denom: i32) -> Option<String> {
+    match denom {
+        1 => Some("1".to_string()),
+        2 => Some("2".to_string()),
+        4 => Some("4".to_string()),
+        8 => Some("8".to_string()),
+        16 => Some("16".to_string()),
+        32 => Some("32".to_string()),
+        64 => Some("64".to_string()),
+        128 => Some("128".to_string()),
+        _ => None,
+    }
+}
+
+fn type_to_duration(kind: &str) -> Option<String> {
+    match kind.trim() {
+        "maxima" => Some("maxima".to_string()),
+        "long" | "longa" => Some("longa".to_string()),
+        "breve" => Some("breve".to_string()),
+        "whole" => Some("1".to_string()),
+        "half" => Some("2".to_string()),
+        "quarter" => Some("4".to_string()),
+        "eighth" => Some("8".to_string()),
+        "16th" => Some("16".to_string()),
+        "32nd" => Some("32".to_string()),
+        "64th" => Some("64".to_string()),
+        "128th" => Some("128".to_string()),
+        _ => None,
+    }
+}
+
+fn parse_key(key_node: Node<'_, '_>) -> Option<String> {
+    let fifths = first_child_i32(key_node, "fifths")?;
+    let mode = first_child_text(key_node, "mode").unwrap_or_else(|| "major".to_string());
+    let major = [
+        (-7, "Cb"),
+        (-6, "Gb"),
+        (-5, "Db"),
+        (-4, "Ab"),
+        (-3, "Eb"),
+        (-2, "Bb"),
+        (-1, "F"),
+        (0, "C"),
+        (1, "G"),
+        (2, "D"),
+        (3, "A"),
+        (4, "E"),
+        (5, "B"),
+        (6, "F#"),
+        (7, "C#"),
+    ];
+    let minor = [
+        (-7, "ab"),
+        (-6, "eb"),
+        (-5, "bb"),
+        (-4, "f"),
+        (-3, "c"),
+        (-2, "g"),
+        (-1, "d"),
+        (0, "a"),
+        (1, "e"),
+        (2, "b"),
+        (3, "f#"),
+        (4, "c#"),
+        (5, "g#"),
+        (6, "d#"),
+        (7, "a#"),
+    ];
+    let table = if mode.eq_ignore_ascii_case("minor") {
+        minor.as_slice()
+    } else {
+        major.as_slice()
+    };
+    table
+        .iter()
+        .find(|(count, _)| *count == fifths)
+        .map(|(_, key)| (*key).to_string())
+}
+
+fn parse_time(time_node: Node<'_, '_>) -> Option<String> {
+    let symbol = time_node.attribute("symbol");
+    if symbol.is_some_and(|value| value.eq_ignore_ascii_case("common")) {
+        return Some("common".to_string());
+    }
+    if symbol.is_some_and(|value| value.eq_ignore_ascii_case("cut")) {
+        return Some("cut".to_string());
+    }
+    let beats = first_child_text(time_node, "beats")?;
+    let beat_type = first_child_text(time_node, "beat-type")?;
+    Some(format!("{beats}/{beat_type}"))
+}
+
+fn parse_clef(clef_node: Node<'_, '_>) -> String {
+    let sign = first_child_text(clef_node, "sign").unwrap_or_else(|| "G".to_string());
+    let line = first_child_i32(clef_node, "line").unwrap_or(2);
+    let octave_change = first_child_i32(clef_node, "clef-octave-change").unwrap_or(0);
+
+    let base = match (sign.as_str(), line) {
+        ("G", 2) => "treble",
+        ("F", 4) => "bass",
+        ("C", 3) => "alto",
+        ("C", 4) => "tenor",
+        ("percussion", _) | ("PERCUSSION", _) => "percussion",
+        _ => "treble",
+    };
+
+    match (base, octave_change) {
+        ("treble", 1) => "treble-8a".to_string(),
+        ("treble", -1) => "treble-8b".to_string(),
+        ("treble", 2) => "treble-15a".to_string(),
+        ("treble", -2) => "treble-15b".to_string(),
+        ("bass", 1) => "bass-8a".to_string(),
+        ("bass", -1) => "bass-8b".to_string(),
+        ("bass", 2) => "bass-15a".to_string(),
+        ("bass", -2) => "bass-15b".to_string(),
+        _ => base.to_string(),
+    }
+}
+
+fn parse_barline(barline: Node<'_, '_>) -> String {
+    if let Some(repeat) = barline.children().find(|node| node.has_tag_name("repeat")) {
+        match repeat.attribute("direction") {
+            Some("forward") => return "|:".to_string(),
+            Some("backward") => return ":|".to_string(),
+            _ => {}
+        }
+    }
+
+    match first_child_text(barline, "bar-style").as_deref() {
+        Some("light-heavy") => "|.".to_string(),
+        Some("light-light") => "||".to_string(),
+        Some("heavy-light") => "|:".to_string(),
+        Some("heavy-heavy") => "||".to_string(),
+        _ => "|".to_string(),
+    }
+}
+
+fn harmony_text(harmony: Node<'_, '_>) -> Option<String> {
+    let root = harmony.children().find(|node| node.has_tag_name("root"))?;
+    let step = first_child_text(root, "root-step")?;
+    let alter = first_child_i32(root, "root-alter").unwrap_or(0);
+    let kind = first_child_text(harmony, "kind").unwrap_or_default();
+    let bass = harmony.children().find(|node| node.has_tag_name("bass"));
+
+    let mut text = step;
+    text.push_str(match alter {
+        1 => "#",
+        -1 => "b",
+        2 => "##",
+        -2 => "bb",
+        _ => "",
+    });
+    text.push_str(match kind.as_str() {
+        "major" => "",
+        "minor" => "m",
+        "dominant" => "7",
+        "major-seventh" => "maj7",
+        "minor-seventh" => "m7",
+        "diminished" => "dim",
+        "augmented" => "aug",
+        "suspended-fourth" => "sus4",
+        "suspended-second" => "sus2",
+        "none" => "",
+        other => other,
+    });
+
+    if let Some(bass) = bass {
+        if let Some(step) = first_child_text(bass, "bass-step") {
+            text.push('/');
+            text.push_str(&step);
+            text.push_str(match first_child_i32(bass, "bass-alter").unwrap_or(0) {
+                1 => "#",
+                -1 => "b",
+                2 => "##",
+                -2 => "bb",
+                _ => "",
+            });
+        }
+    }
+
+    Some(text)
+}
+
+fn parse_lyric(lyric: Node<'_, '_>) -> Option<String> {
+    let mut text = String::new();
+    for child in lyric.children().filter(|node| node.is_element()) {
+        match child.tag_name().name() {
+            "syllabic" => {}
+            "text" => text.push_str(child.text().unwrap_or("")),
+            "extend" => text.push('_'),
+            _ => {}
+        }
+    }
+
+    if text.is_empty() {
+        None
+    } else {
+        let syllabic = first_child_text(lyric, "syllabic");
+        if syllabic.as_deref() == Some("begin") || syllabic.as_deref() == Some("middle") {
+            text.push('-');
+        }
+        Some(text)
+    }
+}
+
+fn staff_from_voice(voice: Option<&str>) -> Option<usize> {
+    let voice = voice?.parse::<usize>().ok()?;
+    if voice >= 5 { Some(2) } else { Some(1) }
+}
+
+fn clef_base_octave(clef: &str) -> i32 {
+    if clef.starts_with("bass") { 3 } else { 4 }
+}
+
+fn emit_typst(score: &Score, options: &ConversionOptions) -> String {
+    let mut out = String::new();
+    if options.include_comment {
+        out.push_str("// Generated by musicxml-to-scorify.\n");
+    }
+    if options.include_import {
+        out.push_str("#import \"");
+        out.push_str(&escape_typst_string(&options.package));
+        out.push_str("\": score\n\n");
+    }
+
+    out.push_str("#score(\n");
+    if let Some(title) = &score.title {
+        out.push_str("  title: \"");
+        out.push_str(&escape_typst_string(title));
+        out.push_str("\",\n");
+    }
+    if let Some(composer) = &score.composer {
+        out.push_str("  composer: \"");
+        out.push_str(&escape_typst_string(composer));
+        out.push_str("\",\n");
+    }
+    out.push_str("  key: \"");
+    out.push_str(&escape_typst_string(score.key.as_deref().unwrap_or("C")));
+    out.push_str("\",\n");
+    if let Some(time) = &score.time {
+        out.push_str("  time: \"");
+        out.push_str(&escape_typst_string(time));
+        out.push_str("\",\n");
+    }
+    if let Some(measures_per_line) = options.measures_per_line {
+        out.push_str("  measures-per-line: ");
+        out.push_str(&measures_per_line.to_string());
+        out.push_str(",\n");
+    }
+
+    out.push_str("  staves: (\n");
+    for staff in &score.staves {
+        out.push_str("    (\n");
+        out.push_str("      clef: \"");
+        out.push_str(&escape_typst_string(&staff.clef));
+        out.push_str("\",\n");
+        if let Some(name) = &staff.instrument_name {
+            out.push_str("      instrument-name: \"");
+            out.push_str(&escape_typst_string(name));
+            out.push_str("\",\n");
+        }
+        if let Some(name) = &staff.instrument_name_cont {
+            out.push_str("      instrument-name-cont: \"");
+            out.push_str(&escape_typst_string(name));
+            out.push_str("\",\n");
+        }
+        if staff.brace_start {
+            out.push_str("      brace-start: true,\n");
+        }
+        if staff.brace_end {
+            out.push_str("      brace-end: true,\n");
+        }
+        if staff.bracket_start {
+            out.push_str("      bracket-start: true,\n");
+        }
+        if staff.bracket_end {
+            out.push_str("      bracket-end: true,\n");
+        }
+        out.push_str("      music: \"");
+        out.push_str(&escape_typst_string(&staff.music));
+        out.push_str("\",\n");
+        out.push_str("    ),\n");
+    }
+    out.push_str("  ),\n");
+    out.push_str(")\n");
+    out
+}
+
+fn first_child_text(node: Node<'_, '_>, tag: &str) -> Option<String> {
+    node.children()
+        .find(|child| child.is_element() && child.has_tag_name(tag))
+        .and_then(node_text)
+}
+
+fn first_descendant_text(node: Node<'_, '_>, tag: &str) -> Option<String> {
+    node.descendants()
+        .find(|child| child.is_element() && child.has_tag_name(tag))
+        .and_then(node_text)
+}
+
+fn first_child_i32(node: Node<'_, '_>, tag: &str) -> Option<i32> {
+    first_child_text(node, tag)?.trim().parse().ok()
+}
+
+fn first_child_usize(node: Node<'_, '_>, tag: &str) -> Option<usize> {
+    first_child_text(node, tag)?.trim().parse().ok()
+}
+
+fn node_text(node: Node<'_, '_>) -> Option<String> {
+    let text = node.text()?.trim();
+    if text.is_empty() {
+        None
+    } else {
+        Some(text.to_string())
+    }
+}
+
+fn escape_typst_string(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+}
+
+fn escape_inline(value: &str) -> String {
+    value.replace(']', "\\]")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SIMPLE_XML: &str = r#"
+<?xml version="1.0" encoding="UTF-8"?>
+<score-partwise version="4.0">
+  <work><work-title>Tiny Tune</work-title></work>
+  <identification><creator type="composer">A. Composer</creator></identification>
+  <part-list>
+    <score-part id="P1"><part-name>Piano</part-name><part-abbreviation>Pno.</part-abbreviation></score-part>
+  </part-list>
+  <part id="P1">
+    <measure number="1">
+      <attributes>
+        <divisions>2</divisions>
+        <key><fifths>2</fifths></key>
+        <time><beats>4</beats><beat-type>4</beat-type></time>
+        <staves>2</staves>
+        <clef number="1"><sign>G</sign><line>2</line></clef>
+        <clef number="2"><sign>F</sign><line>4</line></clef>
+      </attributes>
+      <direction><direction-type><dynamics><mf/></dynamics></direction-type></direction>
+      <note>
+        <pitch><step>F</step><alter>1</alter><octave>4</octave></pitch>
+        <duration>2</duration><voice>1</voice><type>quarter</type><staff>1</staff>
+        <lyric><syllabic>single</syllabic><text>Joy</text></lyric>
+      </note>
+      <note>
+        <chord/>
+        <pitch><step>A</step><octave>4</octave></pitch>
+        <duration>2</duration><voice>1</voice><type>quarter</type><staff>1</staff>
+      </note>
+      <note>
+        <rest/><duration>2</duration><voice>1</voice><type>quarter</type><staff>1</staff>
+      </note>
+      <backup><duration>4</duration></backup>
+      <note>
+        <pitch><step>D</step><octave>3</octave></pitch>
+        <duration>4</duration><voice>5</voice><type>half</type><staff>2</staff>
+      </note>
+    </measure>
+  </part>
+</score-partwise>
+"#;
+
+    #[test]
+    fn converts_simple_grand_staff_score() {
+        let result = convert_musicxml_to_scorify(
+            SIMPLE_XML,
+            &ConversionOptions {
+                include_import: false,
+                ..ConversionOptions::default()
+            },
+        )
+        .unwrap();
+
+        assert!(result.contains("title: \"Tiny Tune\""));
+        assert!(result.contains("composer: \"A. Composer\""));
+        assert!(result.contains("key: \"D\""));
+        assert!(result.contains("time: \"4/4\""));
+        assert!(result.contains("brace-start: true"));
+        assert!(result.contains("brace-end: true"));
+        assert!(
+            result.contains("music: \"<f# a>4v[mf]l[Joy] r4\""),
+            "{result}"
+        );
+        assert!(result.contains("music: \"d2\""), "{result}");
+    }
+
+    #[test]
+    fn maps_minor_keys_and_octaves() {
+        let xml = r#"
+<score-partwise version="4.0">
+  <part-list><score-part id="P1"><part-name>Flute</part-name></score-part></part-list>
+  <part id="P1"><measure number="1">
+    <attributes><divisions>1</divisions><key><fifths>-3</fifths><mode>minor</mode></key><clef><sign>G</sign><line>2</line></clef></attributes>
+    <note><pitch><step>C</step><octave>5</octave></pitch><duration>1</duration><type>quarter</type></note>
+    <note><pitch><step>B</step><alter>-1</alter><octave>3</octave></pitch><duration>1</duration><type>quarter</type></note>
+  </measure></part>
+</score-partwise>
+"#;
+        let result = convert_musicxml_to_scorify(
+            xml,
+            &ConversionOptions {
+                include_import: false,
+                ..ConversionOptions::default()
+            },
+        )
+        .unwrap();
+
+        assert!(result.contains("key: \"c\""));
+        assert!(result.contains("c'4"));
+        assert!(result.contains("b&,4"));
+    }
+
+    #[test]
+    fn accepts_musicxml_doctype_declarations() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE score-partwise PUBLIC "-//Recordare//DTD MusicXML 4.0 Partwise//EN" "http://www.musicxml.org/dtds/partwise.dtd">
+<score-partwise version="4.0">
+  <part-list><score-part id="P1"><part-name>Voice</part-name></score-part></part-list>
+  <part id="P1"><measure number="1">
+    <attributes><divisions>1</divisions><time><beats>4</beats><beat-type>4</beat-type></time></attributes>
+    <note><pitch><step>C</step><octave>4</octave></pitch><duration>1</duration><type>quarter</type></note>
+  </measure></part>
+</score-partwise>
+"#;
+
+        let result = convert_musicxml_to_scorify(
+            xml,
+            &ConversionOptions {
+                include_import: false,
+                ..ConversionOptions::default()
+            },
+        )
+        .unwrap();
+
+        assert!(result.contains("time: \"4/4\""));
+        assert!(result.contains("music: \"c4\""));
+    }
+}

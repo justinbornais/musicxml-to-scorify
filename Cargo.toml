@@ -1,0 +1,21 @@
+[package]
+name = "musicxml-to-scorify"
+version = "0.1.0"
+edition = "2024"
+description = "Convert MusicXML scores into Typst Scorify #score calls"
+license = "MIT"
+
+[dependencies]
+roxmltree = "0.20"
+thiserror = "1.0"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+zip = { version = "2.2", default-features = false, features = ["deflate"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+
+[lib]
+crate-type = ["rlib"]
